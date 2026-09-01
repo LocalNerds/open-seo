@@ -18,6 +18,7 @@ const ERROR_CODES = [
   "RATE_LIMITED",
   "UPSTREAM_UNAVAILABLE",
   "CONFLICT",
+  "IDEMPOTENCY_CONFLICT",
   "INTERNAL_ERROR",
 ] as const;
 
@@ -34,6 +35,7 @@ const NON_REPORTABLE_ERROR_CODES = new Set<ErrorCode>([
   "AUDIT_CAPACITY_REACHED",
   "AUDIT_PAGE_LIMIT_EXCEEDED",
   "AUDIT_ALREADY_RUNNING",
+  "IDEMPOTENCY_CONFLICT",
 ]);
 
 export function isErrorCode(value: string): value is ErrorCode {

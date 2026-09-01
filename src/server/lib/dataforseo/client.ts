@@ -34,7 +34,7 @@ export function loadDataforseoSections(): Promise<DataforseoSections> {
 }
 
 /**
- * Wraps a section fetcher with billing metering. Each entry on the client is
+ * Wraps a section fetcher with billing metering. Default client entries use
  * `meter(customer, (s) => s.fetchX, defaultFeature?)`, which returns a function
  * with the fetcher's own input type and resolves to its unwrapped `.data`. The
  * picker indirection (rather than the fetcher itself) keeps the section
@@ -52,6 +52,30 @@ function meter<I, T>(
   ) => (input: I) => Promise<DataforseoApiResponse<T>>,
   defaultFeature?: CreditFeature,
 ): (input: I & { creditFeature?: CreditFeature }) => Promise<T> {
+  return async (input) =>
+    (
+      await meterDataforseoCall(
+        customer,
+        async () => pick(await loadDataforseoSections())(input),
+        input.creditFeature ?? defaultFeature,
+      )
+    ).data;
+}
+
+/**
+ * Runs through the same billing seam as `meter`, but preserves the provider's
+ * task billing envelope for the small set of callers that must emit an exact
+ * provider receipt. The default client surface stays data-only.
+ */
+function meterWithReceipt<I, T>(
+  customer: BillingCustomerContext,
+  pick: (
+    sections: DataforseoSections,
+  ) => (input: I) => Promise<DataforseoApiResponse<T>>,
+  defaultFeature?: CreditFeature,
+): (
+  input: I & { creditFeature?: CreditFeature },
+) => Promise<DataforseoApiResponse<T>> {
   return (input) =>
     meterDataforseoCall(
       customer,
@@ -81,6 +105,11 @@ export function createDataforseoClient(customer: BillingCustomerContext) {
       // task_post is where DataForSEO charges; collection runs unmetered
       // through fetchBusinessDataTaskResult (see index.ts).
       reviewsTaskPost: meter(
+        customer,
+        (s) => s.postGoogleReviewsTask,
+        "local_seo",
+      ),
+      reviewsTaskPostWithReceipt: meterWithReceipt(
         customer,
         (s) => s.postGoogleReviewsTask,
         "local_seo",
@@ -155,12 +184,11 @@ async function meterDataforseoCall<T>(
   customer: BillingCustomerContext,
   execute: () => Promise<DataforseoApiResponse<T>>,
   creditFeature?: CreditFeature,
-): Promise<T> {
+): Promise<DataforseoApiResponse<T>> {
   const isHostedMode = await isHostedServerAuthMode();
 
   if (!isHostedMode) {
-    const result = await execute();
-    return result.data;
+    return execute();
   }
 
   const billingCustomer = await getOrCreateOrganizationCustomer(customer);
@@ -201,7 +229,7 @@ async function meterDataforseoCall<T>(
     creditFeature,
   });
 
-  return result.data;
+  return result;
 }
 
 async function trackDataforseoCost(args: {

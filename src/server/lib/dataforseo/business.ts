@@ -183,6 +183,7 @@ type BusinessIdentifierInput = {
   keyword?: string;
   cid?: string;
   placeId?: string;
+  tag?: string;
 };
 
 export async function postGoogleReviewsTask(
@@ -206,6 +207,7 @@ export async function postGoogleReviewsTask(
           language_code: input.languageCode,
           depth: input.depth,
           priority: TASK_PRIORITY_HIGH,
+          tag: input.tag,
         }),
       ]),
     );
@@ -221,9 +223,105 @@ export async function postGoogleReviewsTask(
         depth: input.depth,
         sort_by: input.sortBy,
         priority: TASK_PRIORITY_HIGH,
+        tag: input.tag,
       }),
     ]),
   );
+}
+
+type ReadyBusinessReviewsTask = {
+  taskId: string;
+  endpoint: "reviews" | "extended_reviews";
+  collectionPath: string;
+  datePosted: string | null;
+};
+
+const readyBusinessReviewsTaskSchema = z
+  .object({
+    id: z.string().min(1),
+    se: z.literal("google"),
+    se_type: z.enum(["reviews", "extended_reviews"]),
+    date_posted: z.string().nullable().optional(),
+    tag: z.string(),
+    endpoint: z.string(),
+  })
+  .passthrough();
+
+function exactCollectionPath(
+  value: string,
+  endpoint: "reviews" | "extended_reviews",
+  taskId: string,
+) {
+  try {
+    const url = new URL(value, "https://api.dataforseo.com");
+    if (
+      value.startsWith("http") &&
+      url.origin !== "https://api.dataforseo.com"
+    ) {
+      return null;
+    }
+    const expected = `/v3/business_data/google/${endpoint}/task_get/${taskId}`;
+    return url.pathname === expected && !url.search && !url.hash
+      ? expected
+      : null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Reads the free provider recovery queue, returning only exact-tag matches for
+ * the selected endpoint. Unrelated tasks are neither returned nor persisted.
+ */
+export async function fetchBusinessReviewsReadyTasks(input: {
+  tag: string;
+  endpoint: "reviews" | "extended_reviews";
+}): Promise<ReadyBusinessReviewsTask[]> {
+  const api = businessDataApi();
+  const response =
+    input.endpoint === "reviews"
+      ? await api.googleReviewsTasksReady()
+      : await api.googleExtendedReviewsTasksReady();
+  const task = response?.tasks?.[0];
+  if (
+    !response ||
+    response.status_code !== 20000 ||
+    task?.status_code !== 20000
+  ) {
+    throw new AppError(
+      "INTERNAL_ERROR",
+      task?.status_message ||
+        response?.status_message ||
+        "DataForSEO tasks_ready failed",
+    );
+  }
+
+  return (task.result ?? []).flatMap((candidate) => {
+    const parsed = readyBusinessReviewsTaskSchema.safeParse(candidate);
+    if (!parsed.success) return [];
+    const item = parsed.data;
+    if (
+      item.tag !== input.tag ||
+      item.se_type !== input.endpoint ||
+      item.se !== "google"
+    ) {
+      return [];
+    }
+    const collectionPath = exactCollectionPath(
+      item.endpoint,
+      input.endpoint,
+      item.id,
+    );
+    if (!collectionPath) return [];
+    return [
+      {
+        taskId: item.id,
+        endpoint: input.endpoint,
+        collectionPath,
+        datePosted: item.date_posted ?? null,
+      },
+    ];
+  });
 }
 
 export async function postMyBusinessUpdatesTask(

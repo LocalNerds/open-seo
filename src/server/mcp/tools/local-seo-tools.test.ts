@@ -1,4 +1,11 @@
+/* eslint-disable max-lines */
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import type {
+  executeBusinessReviewsProviderTask,
+  ProviderTaskReceipt,
+  recordBusinessReviewsCollection,
+} from "@/server/features/provider-tasks/services/ProviderTaskService";
+import type { fetchBusinessReviewsReadyTasks } from "@/server/lib/dataforseo";
 import { AppError } from "@/server/lib/errors";
 import {
   getBusinessProfileTool,
@@ -12,7 +19,17 @@ const mocks = vi.hoisted(() => ({
   createDataforseoClient: vi.fn(),
   fetchBusinessDataTaskResult: vi.fn(),
   fetchBusinessListingsCategories: vi.fn(),
+  fetchBusinessReviewsReadyTasks:
+    vi.fn<typeof fetchBusinessReviewsReadyTasks>(),
+  executeBusinessReviewsProviderTask:
+    vi.fn<typeof executeBusinessReviewsProviderTask>(),
+  recordBusinessReviewsCollection:
+    vi.fn<typeof recordBusinessReviewsCollection>(),
   getProjectForOrganization: vi.fn(),
+  buildCacheKey:
+    vi.fn<
+      (prefix: string, params: Record<string, unknown>) => Promise<string>
+    >(),
   getCached: vi.fn(),
   setCached: vi.fn(),
 }));
@@ -23,10 +40,20 @@ vi.mock("@/server/lib/dataforseo", () => ({
   createDataforseoClient: mocks.createDataforseoClient,
   fetchBusinessDataTaskResult: mocks.fetchBusinessDataTaskResult,
   fetchBusinessListingsCategories: mocks.fetchBusinessListingsCategories,
+  fetchBusinessReviewsReadyTasks: mocks.fetchBusinessReviewsReadyTasks,
 }));
 
+vi.mock(
+  "@/server/features/provider-tasks/services/ProviderTaskService",
+  () => ({
+    executeBusinessReviewsProviderTask:
+      mocks.executeBusinessReviewsProviderTask,
+    recordBusinessReviewsCollection: mocks.recordBusinessReviewsCollection,
+  }),
+);
+
 vi.mock("@/server/lib/r2-cache", () => ({
-  buildCacheKey: (prefix: string) => Promise.resolve(`${prefix}:key`),
+  buildCacheKey: mocks.buildCacheKey,
   getCached: mocks.getCached,
   setCached: mocks.setCached,
 }));
@@ -38,6 +65,38 @@ vi.mock("@/server/features/projects/services/ProjectService", () => ({
 }));
 
 const toolContext = makeToolContext();
+const RUN_ID = "11111111-1111-4111-8111-111111111111";
+
+function durableReceipt(
+  overrides: Partial<ProviderTaskReceipt> = {},
+): ProviderTaskReceipt {
+  return {
+    runId: RUN_ID,
+    requestVersion: "business-reviews-v1",
+    requestFingerprint: "request-fingerprint",
+    state: "provider_confirmed",
+    providerTag: "opaque-provider-tag",
+    providerTaskId: "task-1",
+    providerEndpoint: "reviews",
+    providerPath: ["v3", "business_data", "google", "reviews", "task_post"],
+    providerStatusCode: 20100,
+    returnedCostUsd: 0.002,
+    returnedCostUsdText: "0.002",
+    returnedCostMicrousd: 2000,
+    costEvidence: "exact",
+    paidTaskCreated: true,
+    postAttemptCount: 1,
+    replayCount: 0,
+    reconciliationCount: 0,
+    gate4Eligible: true,
+    lastFailureCode: null,
+    operatorHoldReason: null,
+    postAttemptedAt: "2026-08-31T18:00:00.000Z",
+    providerConfirmedAt: "2026-08-31T18:00:01.000Z",
+    completedAt: null,
+    ...overrides,
+  };
+}
 
 const byText = (a: string, b: string) => a.localeCompare(b);
 
@@ -48,6 +107,31 @@ beforeEach(() => {
     languageCode: "en",
   });
   mocks.getCached.mockResolvedValue(null);
+  mocks.buildCacheKey.mockImplementation((prefix: string) =>
+    Promise.resolve(`${prefix}:key`),
+  );
+  mocks.executeBusinessReviewsProviderTask.mockImplementation(async (input) => {
+    const posted = await input.postTask("opaque-provider-tag");
+    return {
+      kind: "collect",
+      endpoint: input.endpoint,
+      taskId: posted.data,
+      receipt: durableReceipt({
+        providerTaskId: posted.data,
+        providerEndpoint: input.endpoint,
+        providerPath: posted.billing.path,
+        returnedCostUsd: posted.billing.costUsd,
+      }),
+    };
+  });
+  mocks.recordBusinessReviewsCollection.mockImplementation(async (input) =>
+    durableReceipt({
+      state: input.state,
+      completedAt:
+        input.state === "completed" ? "2026-08-31T18:00:10.000Z" : null,
+      lastFailureCode: input.failureCode ?? null,
+    }),
+  );
 });
 
 describe("get_business_profile", () => {
@@ -124,9 +208,15 @@ describe("get_business_reviews", () => {
 
   it("returns a resumable taskId when the task is still queued", async () => {
     vi.useFakeTimers();
-    const reviewsTaskPost = vi.fn().mockResolvedValue("task-1");
+    const reviewsTaskPostWithReceipt = vi.fn().mockResolvedValue({
+      data: "task-1",
+      billing: {
+        costUsd: 0.002,
+        path: ["v3", "business_data", "google", "reviews", "task_post"],
+      },
+    });
     mocks.createDataforseoClient.mockReturnValue({
-      business: { reviewsTaskPost },
+      business: { reviewsTaskPostWithReceipt },
     });
     mocks.fetchBusinessDataTaskResult.mockResolvedValue({
       status: "pending",
@@ -134,50 +224,220 @@ describe("get_business_reviews", () => {
     });
 
     const pending = getBusinessReviewsTool.handler(
-      { projectId: "project_1", cid: "123" },
+      { projectId: "project_1", cid: "123", runId: RUN_ID },
       toolContext,
     );
     await vi.runAllTimersAsync();
     const result = await pending;
 
-    expect(reviewsTaskPost).toHaveBeenCalledWith(
+    expect(reviewsTaskPostWithReceipt).toHaveBeenCalledWith(
       expect.objectContaining({
         cid: "123",
         depth: 20,
         sortBy: "newest",
         includeOtherSources: false,
+        tag: "opaque-provider-tag",
       }),
     );
     expect(result.structuredContent).toMatchObject({
       status: "processing",
       taskId: "google:task-1",
+      receipt: {
+        runId: RUN_ID,
+        requestVersion: "business-reviews-v1",
+        requestFingerprint: "request-fingerprint",
+        state: "collection_pending",
+        providerTag: "opaque-provider-tag",
+        providerTaskId: "task-1",
+        providerPath: ["v3", "business_data", "google", "reviews", "task_post"],
+        returnedCostUsd: 0.002,
+        paidTaskCreated: true,
+        returnedCostMicrousd: 2000,
+        costEvidence: "exact",
+        gate4Eligible: true,
+      },
     });
+    expect(
+      Object.keys(result.structuredContent.receipt ?? {}).toSorted(),
+    ).toEqual([
+      "completedAt",
+      "costEvidence",
+      "gate4Eligible",
+      "lastFailureCode",
+      "operatorHoldReason",
+      "paidTaskCreated",
+      "postAttemptCount",
+      "postAttemptedAt",
+      "providerConfirmedAt",
+      "providerEndpoint",
+      "providerPath",
+      "providerStatusCode",
+      "providerTag",
+      "providerTaskId",
+      "reconciliationCount",
+      "replayCount",
+      "requestFingerprint",
+      "requestVersion",
+      "returnedCostMicrousd",
+      "returnedCostUsd",
+      "returnedCostUsdText",
+      "runId",
+      "state",
+    ]);
+    const executionInput =
+      mocks.executeBusinessReviewsProviderTask.mock.calls[0]?.[0];
+    expect(executionInput).toMatchObject({
+      organizationId: "org_123",
+      projectId: "project_1",
+      runId: RUN_ID,
+      endpoint: "reviews",
+      postInput: {
+        cid: "123",
+        locationCode: 2840,
+        languageCode: "en",
+        depth: 20,
+        sortBy: "newest",
+        includeOtherSources: false,
+      },
+    });
+    expect(JSON.stringify(executionInput?.postInput)).not.toMatch(
+      /authorization|password|secret|token/i,
+    );
     expect(textContent(result)).toContain('taskId "google:task-1"');
   });
 
-  it("keeps the taskId recoverable when collection fails after a paid post", async () => {
-    const reviewsTaskPost = vi.fn().mockResolvedValue("task-1");
+  it("keeps the exact receipt recoverable when collection fails after a paid post", async () => {
+    const reviewsTaskPostWithReceipt = vi.fn().mockResolvedValue({
+      data: "task-1",
+      billing: {
+        costUsd: 0.002,
+        path: ["v3", "business_data", "google", "reviews", "task_post"],
+      },
+    });
     mocks.createDataforseoClient.mockReturnValue({
-      business: { reviewsTaskPost },
+      business: { reviewsTaskPostWithReceipt },
     });
     mocks.fetchBusinessDataTaskResult.mockRejectedValue(
       new AppError("UPSTREAM_UNAVAILABLE", "DataForSEO HTTP 502"),
     );
 
-    const failing = getBusinessReviewsTool.handler(
-      { projectId: "project_1", cid: "123" },
+    const result = await getBusinessReviewsTool.handler(
+      { projectId: "project_1", cid: "123", runId: RUN_ID },
       toolContext,
     );
-    await expect(failing).rejects.toMatchObject({
-      code: "UPSTREAM_UNAVAILABLE",
+
+    expect(result.structuredContent).toMatchObject({
+      status: "processing",
+      taskId: "google:task-1",
+      collectionErrorCode: "UPSTREAM_UNAVAILABLE",
+      receipt: {
+        runId: RUN_ID,
+        state: "collection_pending",
+        providerTaskId: "task-1",
+        returnedCostUsd: 0.002,
+        paidTaskCreated: true,
+        lastFailureCode: "UPSTREAM_UNAVAILABLE",
+      },
     });
-    await expect(failing).rejects.toThrow('taskId "google:task-1"');
+    expect(textContent(result)).toContain("reuses the existing provider task");
+    expect(mocks.recordBusinessReviewsCollection).toHaveBeenCalledWith({
+      organizationId: "org_123",
+      runId: RUN_ID,
+      state: "collection_pending",
+      failureCode: "UPSTREAM_UNAVAILABLE",
+    });
+  });
+
+  it("requires a caller-owned runId before any paid-path dependency", async () => {
+    await expect(
+      getBusinessReviewsTool.handler(
+        { projectId: "project_1", cid: "123" },
+        toolContext,
+      ),
+    ).rejects.toMatchObject({ code: "VALIDATION_ERROR" });
+
+    expect(mocks.executeBusinessReviewsProviderTask).not.toHaveBeenCalled();
+    expect(mocks.createDataforseoClient).not.toHaveBeenCalled();
+  });
+
+  it("returns a durable hold without constructing the provider client", async () => {
+    mocks.executeBusinessReviewsProviderTask.mockResolvedValue({
+      kind: "held",
+      receipt: durableReceipt({
+        state: "ambiguous",
+        providerTaskId: null,
+        providerEndpoint: null,
+        operatorHoldReason: "multiple_provider_tag_matches",
+        gate4Eligible: false,
+      }),
+    });
+
+    const result = await getBusinessReviewsTool.handler(
+      { projectId: "project_1", cid: "123", runId: RUN_ID },
+      toolContext,
+    );
+
+    expect(result.structuredContent).toMatchObject({
+      status: "held",
+      receipt: {
+        runId: RUN_ID,
+        operatorHoldReason: "multiple_provider_tag_matches",
+        gate4Eligible: false,
+      },
+    });
+    expect(result.structuredContent).not.toHaveProperty("taskId");
+    expect(mocks.createDataforseoClient).not.toHaveBeenCalled();
+  });
+
+  it("wires exact-tag tasks-ready recovery through the free lazy helper", async () => {
+    vi.useFakeTimers();
+    mocks.fetchBusinessReviewsReadyTasks.mockResolvedValue([
+      {
+        taskId: "task-ready",
+        endpoint: "reviews",
+        collectionPath: "/v3/business_data/google/reviews/task_get/task-ready",
+        datePosted: null,
+      },
+    ]);
+    mocks.fetchBusinessDataTaskResult.mockResolvedValue({
+      status: "pending",
+      result: null,
+    });
+    const reviewsTaskPostWithReceipt = vi.fn().mockResolvedValue({
+      data: "task-1",
+      billing: {
+        costUsd: 0.002,
+        path: ["v3", "business_data", "google", "reviews", "task_post"],
+      },
+    });
+    mocks.createDataforseoClient.mockReturnValue({
+      business: { reviewsTaskPostWithReceipt },
+    });
+
+    const pending = getBusinessReviewsTool.handler(
+      { projectId: "project_1", cid: "123", runId: RUN_ID },
+      toolContext,
+    );
+    await vi.runAllTimersAsync();
+    await pending;
+
+    const executionInput =
+      mocks.executeBusinessReviewsProviderTask.mock.calls[0]?.[0];
+    const matches = await executionInput?.findReadyTasks(
+      "opaque-provider-tag",
+      "reviews",
+    );
+    expect(mocks.fetchBusinessReviewsReadyTasks).toHaveBeenCalledWith({
+      tag: "opaque-provider-tag",
+      endpoint: "reviews",
+    });
+    expect(matches).toHaveLength(1);
   });
 
   it("resumes from a taskId without posting a new task", async () => {
-    const reviewsTaskPost = vi.fn();
+    const reviewsTaskPostWithReceipt = vi.fn();
     mocks.createDataforseoClient.mockReturnValue({
-      business: { reviewsTaskPost },
+      business: { reviewsTaskPostWithReceipt },
     });
     mocks.fetchBusinessDataTaskResult.mockResolvedValue({
       status: "completed",
@@ -201,7 +461,8 @@ describe("get_business_reviews", () => {
       toolContext,
     );
 
-    expect(reviewsTaskPost).not.toHaveBeenCalled();
+    expect(reviewsTaskPostWithReceipt).not.toHaveBeenCalled();
+    expect(mocks.createDataforseoClient).not.toHaveBeenCalled();
     // The prefix picks the endpoint, so a resume never needs the original args.
     expect(mocks.fetchBusinessDataTaskResult).toHaveBeenCalledWith({
       endpoint: "extended_reviews",
@@ -210,7 +471,24 @@ describe("get_business_reviews", () => {
     expect(result.structuredContent).toMatchObject({
       status: "completed",
       taskId: "extended:task-9",
+      receipt: {
+        requestFingerprint: "business-reviews-receipt:key",
+        operation: "task_get",
+        providerTaskId: "task-9",
+        providerPath: [
+          "v3",
+          "business_data",
+          "google",
+          "extended_reviews",
+          "task_get",
+        ],
+        providerStatus: "completed",
+        returnedCostUsd: null,
+        retryOfTaskId: "task-9",
+        paidTaskCreated: false,
+      },
     });
+    expect(result.structuredContent.receipt?.runId).toMatch(/^[0-9a-f-]{36}$/);
     const out = textContent(result);
     expect(out).toContain("# | when | rating | author | source | review");
     expect(out).toContain("Rare bottles and great staff.");

@@ -39,6 +39,10 @@ export const fetchBusinessDataTaskResult: DataforseoSections["fetchBusinessDataT
   async (input) =>
     (await loadDataforseoSections()).fetchBusinessDataTaskResult(input);
 
+export const fetchBusinessReviewsReadyTasks: DataforseoSections["fetchBusinessReviewsReadyTasks"] =
+  async (input) =>
+    (await loadDataforseoSections()).fetchBusinessReviewsReadyTasks(input);
+
 /** Free ($0) at DataForSEO, so it skips the metered client entirely — a
  *  zero-credit org can still list categories. */
 export const fetchBusinessListingsCategories: DataforseoSections["fetchBusinessListingsCategories"] =

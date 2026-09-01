@@ -74,6 +74,7 @@ vi.mock("@/server/lib/dataforseo/serp", () => ({
 vi.mock("@/server/lib/dataforseo/business", () => ({
   fetchBusinessListingsSearch: vi.fn(),
   fetchQuestionsAnswers: vi.fn(),
+  postGoogleReviewsTask: vi.fn(),
 }));
 vi.mock("@/server/lib/dataforseo/backlinks", () => ({
   fetchBacklinksSummary: vi.fn(),
@@ -99,6 +100,7 @@ import {
 } from "@/server/lib/dataforseo/client";
 import { DataforseoChargedTaskError } from "@/server/lib/dataforseo/envelope";
 import { fetchBacklinksSummary } from "@/server/lib/dataforseo/backlinks";
+import { postGoogleReviewsTask } from "@/server/lib/dataforseo/business";
 
 const billingCustomer = {
   organizationId: "org_123",
@@ -149,6 +151,63 @@ describe("meterDataforseoCall with split balances", () => {
     expect(result).toEqual({ rank: 42 });
     expect(checkMock).not.toHaveBeenCalled();
     expect(trackMock).not.toHaveBeenCalled();
+  });
+
+  it("preserves the task id and exact returned cost for receipt callers", async () => {
+    isHostedServerAuthModeMock.mockResolvedValue(false);
+    vi.mocked(postGoogleReviewsTask).mockResolvedValue({
+      data: "task-1",
+      billing: {
+        costUsd: 0.002,
+        path: ["v3", "business_data", "google", "reviews", "task_post"],
+      },
+    });
+
+    const client = createDataforseoClient(billingCustomer);
+    const result = await client.business.reviewsTaskPostWithReceipt({
+      cid: "123",
+      locationCode: 2840,
+      languageCode: "en",
+      depth: 20,
+      sortBy: "newest",
+      includeOtherSources: false,
+    });
+
+    expect(result).toEqual({
+      data: "task-1",
+      billing: {
+        costUsd: 0.002,
+        path: ["v3", "business_data", "google", "reviews", "task_post"],
+      },
+    });
+    expect(checkMock).not.toHaveBeenCalled();
+    expect(trackMock).not.toHaveBeenCalled();
+  });
+
+  it("preserves the receipt after hosted metering runs exactly once", async () => {
+    setupHostedMode();
+    mockBalances(5000, 3000);
+    vi.mocked(postGoogleReviewsTask).mockResolvedValue({
+      data: "task-2",
+      billing: {
+        costUsd: 0.002,
+        path: ["v3", "business_data", "google", "reviews", "task_post"],
+      },
+    });
+
+    const client = createDataforseoClient(billingCustomer);
+    const result = await client.business.reviewsTaskPostWithReceipt({
+      cid: "123",
+      locationCode: 2840,
+      languageCode: "en",
+      depth: 20,
+      sortBy: "newest",
+      includeOtherSources: false,
+    });
+
+    expect(result.data).toBe("task-2");
+    expect(result.billing.costUsd).toBe(0.002);
+    expect(trackMock).toHaveBeenCalledTimes(1);
   });
 
   it("checks both monthly and topup balances in parallel", async () => {

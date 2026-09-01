@@ -4,9 +4,15 @@ import {
   createDataforseoClient,
   fetchBusinessDataTaskResult,
   fetchBusinessListingsCategories,
+  fetchBusinessReviewsReadyTasks,
   type BusinessTaskEndpoint,
   type BusinessTaskOutcome,
 } from "@/server/lib/dataforseo";
+import {
+  executeBusinessReviewsProviderTask,
+  recordBusinessReviewsCollection,
+  type ProviderTaskReceipt,
+} from "@/server/features/provider-tasks/services/ProviderTaskService";
 import { AppError } from "@/server/lib/errors";
 import { buildCacheKey, getCached, setCached } from "@/server/lib/r2-cache";
 import { buildProjectMeta } from "@/server/mcp/context";
@@ -285,6 +291,13 @@ const getBusinessReviewsInputSchema = {
     .describe(
       'Resume a previous call that returned status "processing". Pass back the taskId exactly as returned (format "google:<id>" or "extended:<id>"); it selects the right endpoint on its own. Resuming charges no extra credits.',
     ),
+  runId: z
+    .string()
+    .uuid()
+    .optional()
+    .describe(
+      "Required when taskId is absent. Reuse the same UUID with identical inputs to recover safely without creating another paid task.",
+    ),
 } as const;
 
 type GetBusinessReviewsArgs = z.infer<
@@ -312,6 +325,76 @@ function parseReviewsTaskId(taskId: string): {
     endpoint: match[1] === "extended" ? "extended_reviews" : "reviews",
     taskId: match[2] ?? "",
   };
+}
+
+const businessReviewsReceiptSchema = z.object({
+  runId: z.string().uuid(),
+  requestFingerprint: z.string().min(1).max(128),
+  operation: z.enum(["task_post", "task_get"]),
+  providerTaskId: z.string().min(1).max(128),
+  providerPath: z.array(z.string()),
+  providerStatus: z.enum(["processing", "completed"]),
+  returnedCostUsd: z.number().nonnegative().nullable(),
+  retryOfTaskId: z.string().min(1).max(128).nullable(),
+  paidTaskCreated: z.boolean(),
+});
+
+const providerTaskReceiptSchema = z.object({
+  runId: z.string().uuid(),
+  requestVersion: z.string(),
+  requestFingerprint: z.string(),
+  state: z.enum([
+    "intent_created",
+    "post_in_flight",
+    "provider_confirmed",
+    "collection_pending",
+    "completed",
+    "ambiguous",
+    "failed_unbilled",
+    "failed_charged",
+  ]),
+  providerTag: z.string(),
+  providerTaskId: z.string().nullable(),
+  providerEndpoint: z.enum(["reviews", "extended_reviews"]).nullable(),
+  providerPath: z.array(z.string()),
+  providerStatusCode: z.number().int().nullable(),
+  returnedCostUsd: z.number().nonnegative().nullable(),
+  returnedCostUsdText: z.string().nullable(),
+  returnedCostMicrousd: z.number().int().nonnegative().nullable(),
+  costEvidence: z.enum(["exact", "zero", "unknown"]),
+  paidTaskCreated: z.boolean().nullable(),
+  postAttemptCount: z.number().int().min(0).max(1),
+  replayCount: z.number().int().nonnegative(),
+  reconciliationCount: z.number().int().nonnegative(),
+  gate4Eligible: z.boolean(),
+  lastFailureCode: z.string().nullable(),
+  operatorHoldReason: z.string().nullable(),
+  postAttemptedAt: z.string().nullable(),
+  providerConfirmedAt: z.string().nullable(),
+  completedAt: z.string().nullable(),
+});
+
+type BusinessReviewsReceipt = z.infer<typeof businessReviewsReceiptSchema>;
+type BusinessReviewsReceiptBase = Omit<
+  BusinessReviewsReceipt,
+  "providerStatus"
+>;
+
+function reviewsTaskGetPath(endpoint: BusinessTaskEndpoint): string[] {
+  return [
+    "v3",
+    "business_data",
+    "google",
+    endpoint === "extended_reviews" ? "extended_reviews" : "reviews",
+    "task_get",
+  ];
+}
+
+function completeReviewsReceipt(
+  base: BusinessReviewsReceiptBase,
+  status: BusinessReviewsReceipt["providerStatus"],
+): BusinessReviewsReceipt {
+  return { ...base, providerStatus: status };
 }
 
 // Full review rows carry ~200-char base64 review URLs, avatar URLs, and
@@ -367,10 +450,14 @@ export const getBusinessReviewsTool = {
       "Collects Google reviews for a business, with rating, author, text, and whether the owner replied. Use it for review-gap analysis against competitors and to spot unanswered reviews. Usually completes within this call; if the queued job is still running you get status 'processing' plus a taskId — call again with that taskId in 30-60 seconds to collect the result at no extra cost. Charges credits.",
     inputSchema: getBusinessReviewsInputSchema,
     outputSchema: {
-      status: z.enum(["completed", "processing"]),
-      taskId: z.string(),
+      status: z.enum(["completed", "processing", "failed", "held"]),
+      taskId: z.string().optional(),
       reviews: z.array(looseObjectOutputSchema).optional(),
       totals: looseObjectOutputSchema.nullable().optional(),
+      receipt: z
+        .union([businessReviewsReceiptSchema, providerTaskReceiptSchema])
+        .optional(),
+      collectionErrorCode: z.string().optional(),
       ...optionalMetaOutputSchema,
     },
     annotations: {
@@ -383,35 +470,151 @@ export const getBusinessReviewsTool = {
     const includeOtherSources = args.includeOtherSources ?? false;
     let task: { endpoint: BusinessTaskEndpoint; taskId: string };
     let publicTaskId: string;
+    let durableRunId: string | null = null;
+    let receiptBase: BusinessReviewsReceiptBase | null = null;
+    let receipt: BusinessReviewsReceipt | ProviderTaskReceipt;
+
+    if (args.taskId && args.runId) {
+      throw new AppError(
+        "VALIDATION_ERROR",
+        "Provide taskId for legacy collection or runId for durable recovery, not both.",
+      );
+    }
 
     if (args.taskId) {
       task = parseReviewsTaskId(args.taskId);
       publicTaskId = args.taskId;
+      receiptBase = {
+        runId: crypto.randomUUID(),
+        requestFingerprint: await buildCacheKey("business-reviews-receipt", {
+          operation: "task_get",
+          endpoint: task.endpoint,
+          providerTaskId: task.taskId,
+        }),
+        operation: "task_get",
+        providerTaskId: task.taskId,
+        providerPath: reviewsTaskGetPath(task.endpoint),
+        returnedCostUsd: null,
+        retryOfTaskId: task.taskId,
+        paidTaskCreated: false,
+      };
+      receipt = completeReviewsReceipt(receiptBase, "processing");
     } else {
+      if (!args.runId) {
+        throw new AppError(
+          "VALIDATION_ERROR",
+          "runId is required when taskId is absent.",
+        );
+      }
       const identifier = resolveBusinessIdentifier(args);
-      const client = createDataforseoClient(context.billing);
-      // Only the post is metered; the polling below collects for free.
-      const postedId = await client.business.reviewsTaskPost({
+      const endpoint: "reviews" | "extended_reviews" = includeOtherSources
+        ? "extended_reviews"
+        : "reviews";
+      const postInput = {
         ...identifier,
         ...resolveBusinessLocation(args, context.project),
         depth: args.depth ?? 20,
         // The fetcher's extended branch has no sort_by and ignores this.
         sortBy: args.sortBy ?? "newest",
         includeOtherSources,
-      });
-      task = {
-        endpoint: includeOtherSources ? "extended_reviews" : "reviews",
-        taskId: postedId,
       };
-      publicTaskId = encodeReviewsTaskId(includeOtherSources, postedId);
+      const decision = await executeBusinessReviewsProviderTask({
+        organizationId: context.auth.organizationId,
+        projectId: args.projectId,
+        runId: args.runId,
+        endpoint,
+        postInput,
+        postTask: async (tag) => {
+          // The client is created only after the durable row wins the atomic
+          // post claim. Replays never reach this callback.
+          const client = createDataforseoClient(context.billing);
+          return client.business.reviewsTaskPostWithReceipt({
+            ...postInput,
+            tag,
+          });
+        },
+        findReadyTasks: (tag, readyEndpoint) =>
+          fetchBusinessReviewsReadyTasks({ tag, endpoint: readyEndpoint }),
+      });
+      receipt = decision.receipt;
+      durableRunId = args.runId;
+      if (decision.kind !== "collect") {
+        const text =
+          decision.kind === "failed"
+            ? "The provider task did not produce a collectable task. No automatic repost was attempted."
+            : decision.kind === "held"
+              ? "The provider task is held for operator review. No automatic repost was attempted."
+              : "The provider outcome is still being reconciled. Retry with the same runId and identical inputs. No automatic repost will occur.";
+        return mcpResponse({
+          text,
+          meta: buildProjectMeta(
+            context,
+            args.projectId,
+            `/p/${args.projectId}`,
+          ),
+          structuredContent: {
+            status: decision.kind,
+            receipt: decision.receipt,
+          },
+        });
+      }
+      task = {
+        endpoint: decision.endpoint,
+        taskId: decision.taskId,
+      };
+      publicTaskId = encodeReviewsTaskId(
+        decision.endpoint === "extended_reviews",
+        decision.taskId,
+      );
     }
 
-    const outcome = await pollBusinessTask(task, publicTaskId);
+    const recordCollection = async (
+      state: "collection_pending" | "completed",
+      failureCode?: string,
+    ) => {
+      if (durableRunId) {
+        receipt = await recordBusinessReviewsCollection({
+          organizationId: context.auth.organizationId,
+          runId: durableRunId,
+          state,
+          failureCode,
+        });
+      } else if (receiptBase) {
+        receipt = completeReviewsReceipt(
+          receiptBase,
+          state === "completed" ? "completed" : "processing",
+        );
+      }
+    };
+
+    let outcome: BusinessTaskOutcome;
+    try {
+      outcome = await pollBusinessTask(task, publicTaskId);
+    } catch (error) {
+      if (!(error instanceof AppError)) throw error;
+      await recordCollection("collection_pending", error.code);
+      return mcpResponse({
+        text: `Review collection is temporarily unavailable (${error.code}). Retry get_business_reviews with taskId "${publicTaskId}"; this reuses the existing provider task.`,
+        meta: buildProjectMeta(context, args.projectId, `/p/${args.projectId}`),
+        structuredContent: {
+          status: "processing" as const,
+          taskId: publicTaskId,
+          collectionErrorCode: error.code,
+          receipt,
+        },
+      });
+    }
+
     if (outcome.status === "pending") {
+      await recordCollection("collection_pending");
       return mcpResponse({
         text: `Review collection is still running. Call get_business_reviews again with taskId "${publicTaskId}" in 30-60 seconds — resuming charges no extra credits.`,
         meta: buildProjectMeta(context, args.projectId, `/p/${args.projectId}`),
-        structuredContent: { status: "processing", taskId: publicTaskId },
+        structuredContent: {
+          status: "processing" as const,
+          taskId: publicTaskId,
+          receipt,
+        },
       });
     }
 
@@ -429,6 +632,7 @@ export const getBusinessReviewsTool = {
       : null;
 
     const header = `Collected ${reviews.length} reviews${typeof totals?.reviews_count === "number" ? ` of ${totals.reviews_count} total` : ""}.`;
+    await recordCollection("completed");
     return mcpResponse({
       text:
         reviews.length === 0
@@ -440,6 +644,7 @@ export const getBusinessReviewsTool = {
         taskId: publicTaskId,
         reviews,
         totals,
+        receipt,
       },
     });
   }),

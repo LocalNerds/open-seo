@@ -1,3 +1,4 @@
+/* eslint-disable max-lines-per-function */
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
 vi.mock("@/server/lib/runtime-env", () => ({
@@ -8,6 +9,7 @@ import {
   fetchBusinessDataTaskResult,
   fetchBusinessListingsCategories,
   fetchBusinessListingsSearch,
+  fetchBusinessReviewsReadyTasks,
   fetchMyBusinessInfo,
   postGoogleReviewsTask,
 } from "@/server/lib/dataforseo/business";
@@ -122,6 +124,7 @@ describe("Google business_data fetchers", () => {
       depth: 20,
       sortBy: "newest",
       includeOtherSources: false,
+      tag: "run-tag-1",
     });
 
     const { url, body } = requestOf(fetchMock);
@@ -136,6 +139,7 @@ describe("Google business_data fetchers", () => {
         depth: 20,
         sort_by: "newest",
         priority: 2,
+        tag: "run-tag-1",
       },
     ]);
     expect(result).toEqual({
@@ -174,6 +178,7 @@ describe("Google business_data fetchers", () => {
       // The extended endpoint has no sort_by; the fetcher drops it.
       sortBy: "newest",
       includeOtherSources: true,
+      tag: "run-tag-2",
     });
 
     const { url, body } = requestOf(fetchMock);
@@ -187,6 +192,7 @@ describe("Google business_data fetchers", () => {
         language_code: "en",
         depth: 20,
         priority: 2,
+        tag: "run-tag-2",
       },
     ]);
     expect(result.data).toBe("task-2");
@@ -216,6 +222,100 @@ describe("Google business_data fetchers", () => {
       }),
     ).rejects.toMatchObject({ code: "UPSTREAM_UNAVAILABLE" });
     expect(fetchMock).toHaveBeenCalledTimes(1);
+  });
+
+  it("returns only exact-tag regular review tasks with exact collection paths", async () => {
+    const exactTaskId = "03271137-1535-0199-0000-2765092e73b5";
+    const fetchMock = stubDataforseo({
+      status_code: 20000,
+      tasks: [
+        {
+          status_code: 20000,
+          result: [
+            {
+              id: exactTaskId,
+              se: "google",
+              se_type: "reviews",
+              date_posted: "2026-08-31 18:00:00 +00:00",
+              tag: "exact-tag",
+              endpoint: `/v3/business_data/google/reviews/task_get/${exactTaskId}`,
+            },
+            {
+              id: "other-task",
+              se: "google",
+              se_type: "reviews",
+              tag: "other-tag",
+              endpoint: "/v3/business_data/google/reviews/task_get/other-task",
+            },
+            {
+              id: "wrong-endpoint",
+              se: "google",
+              se_type: "reviews",
+              tag: "exact-tag",
+              endpoint:
+                "/v3/business_data/google/extended_reviews/task_get/wrong-endpoint",
+            },
+          ],
+        },
+      ],
+    });
+
+    const result = await fetchBusinessReviewsReadyTasks({
+      tag: "exact-tag",
+      endpoint: "reviews",
+    });
+
+    expect(requestOf(fetchMock).url).toBe(
+      "https://api.dataforseo.com/v3/business_data/google/reviews/tasks_ready",
+    );
+    expect(result).toEqual([
+      {
+        taskId: exactTaskId,
+        endpoint: "reviews",
+        collectionPath: `/v3/business_data/google/reviews/task_get/${exactTaskId}`,
+        datePosted: "2026-08-31 18:00:00 +00:00",
+      },
+    ]);
+  });
+
+  it("uses the extended queue and rejects mismatched search types", async () => {
+    const taskId = "03271137-1535-0199-0000-2765092e73b5";
+    const fetchMock = stubDataforseo({
+      status_code: 20000,
+      tasks: [
+        {
+          status_code: 20000,
+          result: [
+            {
+              id: taskId,
+              se: "google",
+              se_type: "extended_reviews",
+              tag: "exact-tag",
+              endpoint: `https://api.dataforseo.com/v3/business_data/google/extended_reviews/task_get/${taskId}`,
+            },
+            {
+              id: "wrong-type",
+              se: "google",
+              se_type: "reviews",
+              tag: "exact-tag",
+              endpoint:
+                "/v3/business_data/google/extended_reviews/task_get/wrong-type",
+            },
+          ],
+        },
+      ],
+    });
+
+    const result = await fetchBusinessReviewsReadyTasks({
+      tag: "exact-tag",
+      endpoint: "extended_reviews",
+    });
+
+    expect(requestOf(fetchMock).url).toBe(
+      "https://api.dataforseo.com/v3/business_data/google/extended_reviews/tasks_ready",
+    );
+    expect(result).toHaveLength(1);
+    expect(result[0]?.taskId).toBe(taskId);
   });
 
   it("reports a queued task as pending instead of failing", async () => {

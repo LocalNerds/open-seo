@@ -8,6 +8,7 @@
 
 export {
   fetchBusinessDataTaskResult,
+  fetchBusinessReviewsReadyTasks,
   fetchBusinessListingsCategories,
   fetchBusinessListingsSearch,
   fetchMyBusinessInfo,
