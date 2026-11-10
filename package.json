@@ -140,7 +140,7 @@
     "chalk": "^5.6.2",
     "cheerio": "^1.2.0",
     "drizzle-kit": "^0.31.10",
-    "effect": "4.0.0-beta.93",
+    "effect": "4.0.0-beta.103",
     "knip": "^5.88.1",
     "oxlint": "^1.50.0",
     "oxlint-tsgolint": "^0.15.0",
